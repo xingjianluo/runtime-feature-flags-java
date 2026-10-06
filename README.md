@@ -85,6 +85,49 @@
 
 ---
 
+## 2.5 安全发布：预检、认准版本提交、版本差异
+
+在多人协作推线上配置的场景下，发布链路提供三层额外保障（均为**新增能力**，不改变任何既有用法）。
+
+### 发布前预检（precheck / preflight）
+
+`POST /api/feature-flags/precheck`（或 store 层 `preflight(batch)`）接受与发布完全相同的请求体，
+只对候选批次做**一次检查**，返回：
+
+- `baseVersion`：本次预检基于的版本号（可用来“认准版本再提交”，见下）；
+- `valid` + `issues`：整批能否通过。不合法条目按**类别**区分，不会混成一个笼统失败：
+  - `FLAG_RULE_VIOLATION`（开关规则自相矛盾）
+  - `UNKNOWN_CONFIG_KEY`（键未在 schema 声明）
+  - `TYPE_MISMATCH`（值无法转换为声明类型）
+  - `CONSTRAINT_VIOLATION`（违反 min/max 或枚举约束）
+  - `MISSING_REQUIRED_VALUE`（必填键为空）
+- `changes`：相对当前线上生效版本，每条键会发生什么——`ADDED`（新增）/
+  `OVERWRITTEN`（覆盖）/ `UNCHANGED`（不变），并附**覆盖前后各自的脱敏摘要**
+  （`sha256:<12位>` 或 `absent`），可比对差异但看不到原值。
+
+预检是**纯只读**：跑完后线上状态不变、版本号不前进、灰度判定结果不受影响；
+检查在单个不可变快照上完成，并发读者不会看到任何中间态。
+
+### 认准版本再提交（optimistic concurrency）
+
+发布与回滚都接受可选字段 `expectedBaseVersion`（一般填预检返回的 `baseVersion`）：
+
+- 提供时：若从预检到真正提交之间已有别人提交、当前版本不再是该版本，**整批打回**，
+  返回 `409 VERSION_CONFLICT`（store 层抛 `VersionConflictException`）——与普通校验失败
+  （`422 INVALID_BATCH`）可明确区分；不会覆盖别人的改动，也不会只生效一部分。
+- 不提供时：行为与之前完全一致，既有调用不受影响。
+
+回滚同理：`rollback` 请求体加 `expectedBaseVersion` 即启用同样的冲突保护。
+
+### 版本差异对比（diff）
+
+`GET /api/feature-flags/diff?from=&to=` 对比两个**仍保留在历史中**的版本，
+返回配置键与开关的逐键差异：`ADDED / OVERWRITTEN / UNCHANGED / REMOVED` +
+两侧脱敏摘要。**只返回键名与摘要，不回显敏感原始值**。任一版本已被历史淘汰时返回
+`404 VERSION_NOT_FOUND`，可与其他失败区分。
+
+---
+
 ## 3. 灰度分流规则
 
 判定对同一 `(flagKey, subject)` 是**确定性**的：使用 64 位 FNV-1a 哈希
@@ -119,8 +162,10 @@ config 值与 flag 结构都经 `ValueRedactor` 转为 `sha256:<12位>` 摘要�
 | GET | `/api/feature-flags/history` | 版本历史（仅键名，脱敏） |
 | GET | `/api/feature-flags/changes[?key=]` | 变更记录（脱敏摘要） |
 | GET | `/api/feature-flags/config` | 三层合并后的类型化配置快照 + 观测版本 |
-| POST | `/api/feature-flags/publish` | 原子发布一批 flag/config |
-| POST | `/api/feature-flags/rollback` | 整批回滚到某个保留版本 |
+| POST | `/api/feature-flags/precheck` | 只读预检：分类校验结果 + 逐键变更预览（脱敏摘要），不改变任何状态 |
+| POST | `/api/feature-flags/publish` | 原子发布一批 flag/config（可选 `expectedBaseVersion` 认准版本） |
+| POST | `/api/feature-flags/rollback` | 整批回滚到某个保留版本（可选 `expectedBaseVersion` 认准版本） |
+| GET | `/api/feature-flags/diff?from=&to=` | 两个保留版本间的逐键差异（键名 + 脱敏摘要） |
 
 发布请求示例：
 
@@ -141,15 +186,19 @@ config 值与 flag 结构都经 `ValueRedactor` 转为 `sha256:<12位>` 摘要�
 
 回滚请求：`{"targetVersion": 0, "operator": "bob", "reason": "undo"}`。
 
+发布/回滚均可选带 `expectedBaseVersion`（通常取预检返回的 `baseVersion`）：
+`{"operator": "bob", "expectedBaseVersion": 3, "flags": [...]}`。
+
 错误统一返回 `{ "error": "feature_flag_error", "type": ..., "message": ... }`，按类型映射：
 
 | type | HTTP 状态 | 触发 |
 |---|---|---|
 | `INVALID_BATCH` | 422 | 发布/回滚批次校验失败（整批拒绝） |
+| `VERSION_CONFLICT` | 409 | 认准的基准版本已过期（整批拒绝，不覆盖他人改动） |
 | `TYPE_MISMATCH` | 400 | 取值类型不符 |
 | `INVALID_VALUE` | 400 | 取值非法 / 键未声明 |
 | `MISSING_CONFIG` | 404 | 必填配置缺失 |
-| `VERSION_NOT_FOUND` | 404 | 回滚目标版本不存在或已淘汰 |
+| `VERSION_NOT_FOUND` | 404 | 回滚/对比目标版本不存在或已淘汰 |
 | `BAD_REQUEST` / `MALFORMED_JSON` | 400 | 参数非法 / 请求体格式错误 |
 
 ---
@@ -161,6 +210,9 @@ config 值与 flag 结构都经 `ValueRedactor` 转为 `sha256:<12位>` 摘要�
   适合作嵌入式特性开关/灰度判定与单机演示。需要跨实例一致时，可在存储外层接入持久化或
   广播（本版本不包含）。
 - 无破坏性的向后兼容：读取接口为只读；发布为 upsert 语义；回滚总是新增版本而非覆盖。
+- 安全发布为**纯增量**：`expectedBaseVersion` 在发布/回滚请求中均可选，缺省时行为与上一版
+  完全一致；`/precheck`、`/diff` 为新端点，不影响既有端点；store 层 `publish(batch)` /
+  `rollbackTo(...)` 旧签名保留并委托到新重载。
 
 ---
 
@@ -178,12 +230,33 @@ mvn -o test
 # 启动后手工验证
 mvn -o spring-boot:run
 curl "http://localhost:8080/api/feature-flags/evaluate?key=checkout&subject=u1"
+
+# 预检（只读，返回分类问题与逐键预览，含 baseVersion）
+curl -X POST http://localhost:8080/api/feature-flags/precheck \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"bob","flags":[{"key":"checkout","percentage":50}]}'
+
+# 认准版本发布（把 precheck 返回的 baseVersion 填进来）
+curl -X POST http://localhost:8080/api/feature-flags/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"bob","expectedBaseVersion":0,"flags":[{"key":"checkout","percentage":50}]}'
+
+# 版本差异（只返回键名与脱敏摘要）
+curl "http://localhost:8080/api/feature-flags/diff?from=0&to=1"
 ```
 
 测试（均在日志中打印输入与判定依据）：
 
 - `StoreConcurrencyTest`（7）：16 线程并发发布的单调/无丢失更新、读端永不出现“半个批次”、
   非法批次整批拒绝、强制冲突、回滚整批恢复、过期版本回滚报错、审计记录不含原值；
+- `SafeReleaseTest`（6）：预检逐键预览（新增/覆盖/不变）且状态零副作用、预检按
+  `TYPE_MISMATCH / CONSTRAINT_VIOLATION / UNKNOWN_CONFIG_KEY / MISSING_REQUIRED_VALUE`
+  分类、认准过期版本发布/回滚被 `VersionConflictException` 整批拒绝且与
+  `InvalidBatchException` 可区分、重新认准后整批成功、无认准的旧调用行为不变、
+  版本 diff 的增删改/脱敏断言、已淘汰版本 diff 报 `VersionNotFoundException`；
+- `SafeReleaseApiTest`（3）：`/precheck` 分类与预览且版本不前进、过期 `expectedBaseVersion`
+  发布返回 409 `VERSION_CONFLICT` 且未生效、重新认准后成功、`/diff` 脱敏输出与
+  已淘汰版本 404 `VERSION_NOT_FOUND`；
 - `RolloutEvaluationTest`（5）：分桶稳定性、`0/1/100` 与桶边界、名单与强制覆盖优先级、
   四态可区分、回滚态 vs 未知态；
 - `LayeredConfigTest`（6）：三层优先级与生效时机、经 store 的运行时覆盖与回滚、
@@ -191,4 +264,4 @@ curl "http://localhost:8080/api/feature-flags/evaluate?key=checkout&subject=u1"
 - `FeatureFlagApiTest`（3）：经 MockMvc 的发布/判定/回滚/历史/变更/配置端到端、
   非法批次 422 且无部分生效、错误码区分、脱敏断言。
 
-共计 22 个测试。
+共计 31 个测试。

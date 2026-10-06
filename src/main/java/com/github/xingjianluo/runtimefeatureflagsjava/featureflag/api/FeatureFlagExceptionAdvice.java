@@ -5,6 +5,7 @@ import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.FeatureF
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.InvalidBatchException;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.InvalidConfigValueException;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.MissingConfigException;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.VersionConflictException;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.VersionNotFoundException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -42,6 +43,11 @@ public class FeatureFlagExceptionAdvice {
     @ExceptionHandler(VersionNotFoundException.class)
     public ResponseEntity<ApiDtos.ErrorDto> versionNotFound(VersionNotFoundException e) {
         return build(HttpStatus.NOT_FOUND, "VERSION_NOT_FOUND", e.getMessage());
+    }
+
+    @ExceptionHandler(VersionConflictException.class)
+    public ResponseEntity<ApiDtos.ErrorDto> versionConflict(VersionConflictException e) {
+        return build(HttpStatus.CONFLICT, "VERSION_CONFLICT", e.getMessage());
     }
 
     @ExceptionHandler(IllegalArgumentException.class)

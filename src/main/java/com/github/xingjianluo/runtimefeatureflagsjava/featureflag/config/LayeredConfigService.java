@@ -129,6 +129,11 @@ public class LayeredConfigService {
         return Map.copyOf(out);
     }
 
+    /** Whether the key is declared in the schema (used to categorize validation failures). */
+    public boolean isKnownKey(String key) {
+        return key != null && schema.descriptor(key).isPresent();
+    }
+
     private ConfigKeyDescriptor requireDescriptor(String key) {
         return schema.descriptor(key)
                 .orElseThrow(() -> new InvalidConfigValueException(

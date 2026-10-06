@@ -2,7 +2,11 @@ package com.github.xingjianluo.runtimefeatureflagsjava.featureflag.api;
 
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.audit.ChangeRecord;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.Evaluation;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.KeyChange;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.PreflightIssue;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.PreflightReport;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.Version;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.VersionDiff;
 
 import java.util.List;
 
@@ -21,13 +25,20 @@ public final class ApiDtos {
     public record ConfigEntryDto(String key, String value) {
     }
 
+    /**
+     * @param expectedBaseVersion optional optimistic-concurrency pin: when present and no
+     *                            longer the current version, the batch is rejected with
+     *                            a distinguishable VERSION_CONFLICT; absent keeps legacy behavior
+     */
     public record PublishRequest(List<FlagDto> flags,
                                  List<ConfigEntryDto> config,
                                  String operator,
-                                 String reason) {
+                                 String reason,
+                                 Long expectedBaseVersion) {
     }
 
-    public record RollbackRequest(Long targetVersion, String operator, String reason) {
+    public record RollbackRequest(Long targetVersion, String operator, String reason,
+                                  Long expectedBaseVersion) {
     }
 
     public record ExplanationDto(String reason, String flagKey, Integer bucket, Integer percentage) {
@@ -70,6 +81,40 @@ public final class ApiDtos {
     }
 
     public record ConfigSnapshotDto(long version, java.util.Map<String, Object> values) {
+    }
+
+    /** One categorized preflight issue. */
+    public record PreflightIssueDto(String key, String category, String detail) {
+        static PreflightIssueDto from(PreflightIssue issue) {
+            return new PreflightIssueDto(issue.key(), issue.category().name(), issue.detail());
+        }
+    }
+
+    /** Per-key change with redacted digests only. */
+    public record KeyChangeDto(String key, String kind, String beforeDigest, String afterDigest) {
+        static KeyChangeDto from(KeyChange change) {
+            return new KeyChangeDto(change.key(), change.kind().name(),
+                    change.beforeDigest(), change.afterDigest());
+        }
+    }
+
+    /** Read-only preflight outcome: validity, categorized issues, per-key preview. */
+    public record PreflightReportDto(long baseVersion, boolean valid,
+                                     List<PreflightIssueDto> issues,
+                                     List<KeyChangeDto> changes) {
+        public static PreflightReportDto from(PreflightReport report) {
+            return new PreflightReportDto(report.baseVersion(), report.valid(),
+                    report.issues().stream().map(PreflightIssueDto::from).toList(),
+                    report.changes().stream().map(KeyChangeDto::from).toList());
+        }
+    }
+
+    /** Redacted diff between two retained versions. */
+    public record VersionDiffDto(long fromVersion, long toVersion, List<KeyChangeDto> entries) {
+        public static VersionDiffDto from(VersionDiff diff) {
+            return new VersionDiffDto(diff.fromVersion(), diff.toVersion(),
+                    diff.entries().stream().map(KeyChangeDto::from).toList());
+        }
     }
 
     public record ErrorDto(String error, String type, String message) {
