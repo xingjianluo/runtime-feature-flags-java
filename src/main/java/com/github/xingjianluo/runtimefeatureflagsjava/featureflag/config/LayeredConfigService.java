@@ -116,6 +116,11 @@ public class LayeredConfigService {
         checkConstraints(descriptor, converted);
     }
 
+    /** Whether a key is declared in the schema (distinguishes UNKNOWN_KEY from INVALID_VALUE). */
+    public boolean isKnown(String key) {
+        return schema.isKnown(key);
+    }
+
     /** Fully merged, typed snapshot of every resolvable key. */
     public Map<String, Object> snapshot() {
         Map<String, Object> out = new LinkedHashMap<>();

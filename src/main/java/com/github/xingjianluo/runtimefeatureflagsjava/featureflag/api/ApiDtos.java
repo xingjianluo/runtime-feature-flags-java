@@ -1,8 +1,11 @@
 package com.github.xingjianluo.runtimefeatureflagsjava.featureflag.api;
 
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.audit.ChangeRecord;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.DryRunReport;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.Evaluation;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.KeyDiff;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.Version;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.VersionDiff;
 
 import java.util.List;
 
@@ -24,10 +27,12 @@ public final class ApiDtos {
     public record PublishRequest(List<FlagDto> flags,
                                  List<ConfigEntryDto> config,
                                  String operator,
-                                 String reason) {
+                                 String reason,
+                                 Long expectedVersion) {
     }
 
-    public record RollbackRequest(Long targetVersion, String operator, String reason) {
+    public record RollbackRequest(Long targetVersion, String operator, String reason,
+                                  Long expectedVersion) {
     }
 
     public record ExplanationDto(String reason, String flagKey, Integer bucket, Integer percentage) {
@@ -70,6 +75,37 @@ public final class ApiDtos {
     }
 
     public record ConfigSnapshotDto(long version, java.util.Map<String, Object> values) {
+    }
+
+    /** One categorized validation failure inside a dry-run report. */
+    public record DryRunErrorDto(String key, String type, String detail) {
+    }
+
+    /** Per-key effect with redacted before/after summaries only. */
+    public record KeyDiffDto(String key, String kind, String beforeSummary, String afterSummary) {
+        static KeyDiffDto from(KeyDiff d) {
+            return new KeyDiffDto(d.key(), d.kind().name(), d.beforeSummary(), d.afterSummary());
+        }
+    }
+
+    /** Read-only preflight result: categorized errors + per-key preview + base version. */
+    public record DryRunReportDto(long baseVersion, boolean valid,
+                                  List<DryRunErrorDto> errors, List<KeyDiffDto> changes) {
+        static DryRunReportDto from(DryRunReport r) {
+            return new DryRunReportDto(r.baseVersion(), r.valid(),
+                    r.errors().stream()
+                            .map(e -> new DryRunErrorDto(e.key(), e.type().name(), e.detail()))
+                            .toList(),
+                    r.changes().stream().map(KeyDiffDto::from).toList());
+        }
+    }
+
+    /** Key-level diff between two retained versions; redacted summaries only. */
+    public record VersionDiffDto(long fromVersion, long toVersion, List<KeyDiffDto> changes) {
+        static VersionDiffDto from(VersionDiff d) {
+            return new VersionDiffDto(d.fromVersion(), d.toVersion(),
+                    d.changes().stream().map(KeyDiffDto::from).toList());
+        }
     }
 
     public record ErrorDto(String error, String type, String message) {

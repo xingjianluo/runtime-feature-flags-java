@@ -62,9 +62,25 @@ public class FeatureFlagController {
     @PostMapping("/publish")
     public ApiDtos.PublishResultDto publish(@RequestBody ApiDtos.PublishRequest request) {
         PublishBatch batch = toBatch(request);
-        Version published = store.publish(batch);
+        Version published = store.publish(batch, request.expectedVersion());
         return new ApiDtos.PublishResultDto(published.versionNumber(),
                 store.history().stream().map(ApiDtos.VersionSummaryDto::from).toList());
+    }
+
+    /**
+     * Read-only preflight: validate the batch and preview the per-key effect against
+     * the current version. State, version numbering and evaluations are untouched.
+     */
+    @PostMapping("/publish/dry-run")
+    public ApiDtos.DryRunReportDto dryRun(@RequestBody ApiDtos.PublishRequest request) {
+        PublishBatch batch = toBatch(request);
+        return ApiDtos.DryRunReportDto.from(store.dryRun(batch));
+    }
+
+    /** Key-level diff between two retained versions; redacted summaries only. */
+    @GetMapping("/diff")
+    public ApiDtos.VersionDiffDto diff(@RequestParam long from, @RequestParam long to) {
+        return ApiDtos.VersionDiffDto.from(store.diff(from, to));
     }
 
     /** Atomically roll the whole state back to a retained version. */
@@ -77,7 +93,8 @@ public class FeatureFlagController {
         if (operator == null || operator.isBlank()) {
             throw new InvalidBatchException("operator is required for rollback");
         }
-        Version rolled = store.rollbackTo(request.targetVersion(), operator, request.reason());
+        Version rolled = store.rollbackTo(request.targetVersion(), operator, request.reason(),
+                request.expectedVersion());
         return new ApiDtos.PublishResultDto(rolled.versionNumber(),
                 store.history().stream().map(ApiDtos.VersionSummaryDto::from).toList());
     }

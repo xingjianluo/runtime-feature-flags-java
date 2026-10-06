@@ -3,16 +3,24 @@ package com.github.xingjianluo.runtimefeatureflagsjava.featureflag.store;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.audit.ChangeRecord;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.audit.ValueRedactor;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.config.LayeredConfigService;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.ConfigError;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.ConfigTypeMismatchException;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.InvalidBatchException;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.InvalidConfigValueException;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.MissingConfigException;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.VersionConflictException;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.error.VersionNotFoundException;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.DecisionExplanation;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.DryRunReport;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.Evaluation;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.EvaluationStatus;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.FeatureFlag;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.KeyDiff;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.PublishBatch;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.PublishEntry;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.RolloutRule;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.Version;
+import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.model.VersionDiff;
 import com.github.xingjianluo.runtimefeatureflagsjava.featureflag.rollout.RolloutEvaluator;
 
 import java.util.ArrayDeque;
@@ -85,10 +93,21 @@ public class FeatureFlagStore {
      * Validation uses a private copy so the live version is untouched on failure.
      */
     public Version publish(PublishBatch batch) {
+        return publish(batch, null);
+    }
+
+    /**
+     * Optimistic-concurrency publish: when {@code expectedVersion} is non-null and no
+     * longer matches the current version, the whole batch is rejected with
+     * {@link VersionConflictException} before any validation or mutation. A null
+     * {@code expectedVersion} keeps the legacy unconditional behavior exactly.
+     */
+    public Version publish(PublishBatch batch, Long expectedVersion) {
         if (batch == null) {
             throw new InvalidBatchException("publish batch must be non-null");
         }
         synchronized (writeLock) {
+            checkExpectedVersion(expectedVersion);
             Version base = current;
             // Build candidate on private copies; never mutate the live snapshot.
             Map<String, FeatureFlag> flags = new HashMap<>(base.flags());
@@ -137,15 +156,85 @@ public class FeatureFlagStore {
     }
 
     /**
+     * Read-only preflight: validate a batch and preview its per-key effect against
+     * the current version. Never mutates state, never advances the version.
+     */
+    public DryRunReport dryRun(PublishBatch batch) {
+        if (batch == null) {
+            throw new InvalidBatchException("dry-run batch must be non-null");
+        }
+        // Single volatile read of an immutable snapshot: no lock, no mutation,
+        // concurrent readers and the live version are completely untouched.
+        Version base = current;
+        List<ConfigError> errors = new ArrayList<>();
+        List<KeyDiff> changes = new ArrayList<>();
+        for (PublishEntry entry : batch.entries()) {
+            if (entry.isFlagEntry()) {
+                FeatureFlag flag = entry.flag();
+                errors.addAll(validateFlagTyped(flag));
+                FeatureFlag before = base.flags().get(flag.key());
+                String beforeSummary = before == null ? "absent" : flagFingerprint(before);
+                String afterSummary = flagFingerprint(flag);
+                KeyDiff.Kind kind = before == null
+                        ? KeyDiff.Kind.ADDED
+                        : beforeSummary.equals(afterSummary) ? KeyDiff.Kind.UNCHANGED : KeyDiff.Kind.CHANGED;
+                changes.add(new KeyDiff(flag.key(), kind, beforeSummary, afterSummary));
+            } else {
+                String key = entry.configKey();
+                errors.addAll(validateConfigTyped(key, entry.value()));
+                String beforeRaw = base.configValues().get(key);
+                String beforeSummary = ValueRedactor.redact(beforeRaw);
+                String afterSummary = ValueRedactor.redact(entry.value());
+                KeyDiff.Kind kind = beforeRaw == null
+                        ? KeyDiff.Kind.ADDED
+                        : beforeSummary.equals(afterSummary) ? KeyDiff.Kind.UNCHANGED : KeyDiff.Kind.CHANGED;
+                changes.add(new KeyDiff(key, kind, beforeSummary, afterSummary));
+            }
+        }
+        return new DryRunReport(base.versionNumber(), errors.isEmpty(), errors, changes);
+    }
+
+    /**
+     * Key-level diff between two retained versions; redacted summaries only.
+     * Both versions must still be in the retained history, otherwise a
+     * {@link VersionNotFoundException} distinguishes the expired/unknown version.
+     */
+    public VersionDiff diff(long fromVersion, long toVersion) {
+        synchronized (writeLock) {
+            Version from = findVersion(fromVersion)
+                    .orElseThrow(() -> new VersionNotFoundException(
+                            "version " + fromVersion + " not found in retained history"));
+            Version to = findVersion(toVersion)
+                    .orElseThrow(() -> new VersionNotFoundException(
+                            "version " + toVersion + " not found in retained history"));
+            List<KeyDiff> changes = new ArrayList<>();
+            diffMaps(flagSummaries(from.flags()), flagSummaries(to.flags()), changes);
+            diffMaps(redactValues(from.configValues()), redactValues(to.configValues()), changes);
+            changes.sort(java.util.Comparator.comparing(KeyDiff::key));
+            return new VersionDiff(fromVersion, toVersion, changes);
+        }
+    }
+
+    /**
      * Roll the whole state back to an exact earlier version by publishing a copy of it.
      * The current (and intermediate) versions remain in history; the rollback is a new
      * version, so the operation itself is auditable and can itself be rolled back.
      */
     public Version rollbackTo(long targetVersion, String operator, String reason) {
+        return rollbackTo(targetVersion, operator, reason, null);
+    }
+
+    /**
+     * Optimistic-concurrency rollback: when {@code expectedVersion} is non-null and no
+     * longer matches the current version, the rollback is rejected with
+     * {@link VersionConflictException}. Null keeps the legacy behavior exactly.
+     */
+    public Version rollbackTo(long targetVersion, String operator, String reason, Long expectedVersion) {
         if (operator == null || operator.isBlank()) {
             throw new IllegalArgumentException("rollback operator must be non-blank");
         }
         synchronized (writeLock) {
+            checkExpectedVersion(expectedVersion);
             Version target = findVersion(targetVersion)
                     .orElseThrow(() -> new VersionNotFoundException(
                             "version " + targetVersion + " not found in retained history"));
@@ -234,6 +323,19 @@ public class FeatureFlagStore {
 
     // ---- internals (all called under writeLock unless noted) ----
 
+    /**
+     * Reject the operation when the caller pinned a base version that has since moved.
+     * Runs inside the write lock, before any validation or mutation, so a stale
+     * commit can never partially apply or overwrite someone else's publish.
+     */
+    private void checkExpectedVersion(Long expectedVersion) {
+        if (expectedVersion != null && expectedVersion != current.versionNumber()) {
+            throw new VersionConflictException("expected base version " + expectedVersion
+                    + " but current version is " + current.versionNumber()
+                    + "; the batch was rejected without applying anything");
+        }
+    }
+
     private void commit(Version next) {
         current = next;
         history.addFirst(next);
@@ -260,6 +362,39 @@ public class FeatureFlagStore {
             errors.add(new ConfigErrorLite(flag.key(), "forceEnabled and forceDisabled both set"));
         }
         return errors;
+    }
+
+    /** Typed variant of {@link #validateFlag} for dry-run reports. */
+    private List<ConfigError> validateFlagTyped(FeatureFlag flag) {
+        return validateFlag(flag).stream()
+                .map(e -> new ConfigError(e.key(), ConfigError.Type.INVALID_VALUE, e.detail()))
+                .toList();
+    }
+
+    /**
+     * Validate a config entry and classify the failure so a dry-run report can
+     * distinguish unknown keys, missing required values, type mismatches and
+     * constraint violations instead of collapsing them into one opaque failure.
+     */
+    private List<ConfigError> validateConfigTyped(String key, String raw) {
+        if (configService == null) {
+            return List.of(new ConfigError(key, ConfigError.Type.UNKNOWN_KEY,
+                    "no schema-backed config service available"));
+        }
+        if (!configService.isKnown(key)) {
+            return List.of(new ConfigError(key, ConfigError.Type.UNKNOWN_KEY,
+                    "unknown config key '" + key + "'; not declared in schema"));
+        }
+        try {
+            configService.validateValue(key, raw);
+            return List.of();
+        } catch (MissingConfigException e) {
+            return List.of(new ConfigError(key, ConfigError.Type.MISSING, e.getMessage()));
+        } catch (ConfigTypeMismatchException e) {
+            return List.of(new ConfigError(key, ConfigError.Type.TYPE_MISMATCH, e.getMessage()));
+        } catch (InvalidConfigValueException e) {
+            return List.of(new ConfigError(key, ConfigError.Type.INVALID_VALUE, e.getMessage()));
+        }
     }
 
     private void recordChanges(Version next, PublishBatch batch, String kind) {
@@ -302,6 +437,39 @@ public class FeatureFlagStore {
                 + "|deny=" + flag.rule().denySubjects().size()
                 + "|forceOn=" + flag.rule().forceEnabled()
                 + "|forceOff=" + flag.rule().forceDisabled();
+    }
+
+    /** Structural fingerprints for every flag (no secret payload values). */
+    private static Map<String, String> flagSummaries(Map<String, FeatureFlag> flags) {
+        Map<String, String> out = new HashMap<>();
+        flags.forEach((key, flag) -> out.put(key, flagFingerprint(flag)));
+        return out;
+    }
+
+    /** Redacted digest for every raw config value. */
+    private static Map<String, String> redactValues(Map<String, String> values) {
+        Map<String, String> out = new HashMap<>();
+        values.forEach((key, raw) -> out.put(key, ValueRedactor.redact(raw)));
+        return out;
+    }
+
+    /** Diff two redacted summary maps, appending only keys that differ. */
+    private static void diffMaps(Map<String, String> from, Map<String, String> to,
+                                 List<KeyDiff> out) {
+        java.util.Set<String> keys = new java.util.TreeSet<>();
+        keys.addAll(from.keySet());
+        keys.addAll(to.keySet());
+        for (String key : keys) {
+            String before = from.get(key);
+            String after = to.get(key);
+            if (before == null) {
+                out.add(new KeyDiff(key, KeyDiff.Kind.ADDED, "absent", after));
+            } else if (after == null) {
+                out.add(new KeyDiff(key, KeyDiff.Kind.REMOVED, before, "absent"));
+            } else if (!before.equals(after)) {
+                out.add(new KeyDiff(key, KeyDiff.Kind.CHANGED, before, after));
+            }
+        }
     }
 
     private static String summarize(List<ConfigErrorLite> errors) {
